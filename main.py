@@ -11,21 +11,21 @@ from nltk.util import ngrams
 import pandas as pd
 
 # tf.enable_eager_execution()
-'''
-gpus = tf.config.experimental.list_physical_devices(device_type='GPU')
-tf.config.experimental.set_virtual_device_configuration(
-     gpus[0],
-     [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=1000)])
-'''
+
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run graph2vec based MDS tasks.')
-    parser.add_argument('--mode', nargs='?', default='train', help='must be the val_no_sp/decode')
-    parser.add_argument('--model_mode', nargs='?', default='p', help='v: vertical or p: parallel')
-    parser.add_argument('--ckpt_path', nargs='?', default='./checkpoints/train_large_p_3d_30', help='checkpoint path')
+    parser = argparse.ArgumentParser(description='Run MDS tasks.')
+    parser.add_argument('--mode', nargs='?', default='train', help='must be the train/valid/gen/train_att/valid_att')
+
+    parser.add_argument('--ckpt_path', nargs='?', default='./checkpoints/train_large_p_3d_30',
+                        help='checkpoint path of HT')
+    parser.add_argument('--ckpt_path_att', nargs='?', default='./checkpoints2/3d_l',
+                        help='checkpoint path of att-aware prediction model')
 
     parser.add_argument('--batch_size', type=int, default=8, help='batch size')
     parser.add_argument('--epoch', type=int, default=4, help='epoch')
+    parser.add_argument('--para_num', type=int, default=30, help='the number of source paragraphs')
+    parser.add_argument('--para_len', type=int, default=100, help='the length of each paragraphs')
 
     parser.add_argument('--num_layers', type=int, default=3, help='the number of layers in transformer')
     parser.add_argument('--d_model', type=int, default=256, help='the dimension of embedding')
@@ -37,6 +37,11 @@ def parse_args():
     parser.add_argument('--block_n_grams', type=int, default=3, help='prevent generating n grams')
     parser.add_argument('--block_n_words_before', type=int, default=2, help='block n words before the current step')
 
+    parser.add_argument('--beta', type=float, default=0.8, help='the efficient of att-aware score. when beta=0, there'
+                                                                'is a beam search without att-aware score.')
+    parser.add_argument('--compress_s', type=int, default=30, help='re-rank paragraphs based on the predicted att '
+                                                                   'distribution and select top s paragraphs '
+                                                                   'before inference. s=30 means no compression')
     return parser.parse_args()
 
 
@@ -63,7 +68,7 @@ class RUN:
         self.sp.load('spm9998_3.model')
 
         self.seq2seq = MyModel(args.num_layers, args.d_model, args.num_headers, args.dff, 32000,
-                                args.drop_rate, args.model_mode)
+                                args.drop_rate)
 
         learning_rate = CustomSchedule(args.d_model)
         self.optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
@@ -102,7 +107,7 @@ class RUN:
         tar_real = tar[:, 1:]
 
         with tf.GradientTape() as tape:
-            pre, pw = self.seq2seq(inp, True, ranks, tar_inp)
+            pre, _, _ = self.seq2seq(inp, True, ranks, tar_inp)
             # print(tf.argmax(pre, axis=-1))
 
             loss = self.masked_loss_function(tar_real, pre)
@@ -113,7 +118,7 @@ class RUN:
 
         self.train_loss(loss)
         self.train_acc(tar_real, pre)
-        return tar_real, tf.argmax(pre, axis=-1), pw
+        return tar_real, tf.argmax(pre, axis=-1)
 
     def saver(self, epoch, start):
         ckpt_save_path = self.ckpt_manager.save()
@@ -133,12 +138,12 @@ class RUN:
             self.train_loss.reset_states()
             self.train_acc.reset_states()
 
-            batch_set = generate_batch(args.batch_size, mode=args.mode)
+            batch_set = generate_batch(args.batch_size, mode='train', para_num=args.para_num, para_len=args.para_len)
             for (batch, batch_contents) in enumerate(batch_set):
                 inp, tar, ranks= batch_contents
                 # print(inp.shape, inp_x.shape, ranks.shape, sen_pos.shape,
                 # tar.shape, tar_x.shape)
-                real, pre, pw = self.train_step(inp, ranks, tar)
+                real, pre = self.train_step(inp, ranks, tar)
 
                 if batch % 50 == 0:
                     print(real)
@@ -153,7 +158,7 @@ class RUN:
             self.saver(epoch, start)
 
     def generate_pw(self):
-        batch_set = generate_batch(32, para_num=30, para_len=100, mode='test')
+        batch_set = generate_batch(32, para_num=30, para_len=100, mode='train')
         para_weights = np.zeros([1, 30])
 
         for (batch, batch_contents) in enumerate(batch_set):
@@ -165,9 +170,9 @@ class RUN:
 
             if len(para_weights) >= 10002:
                 break
-        np.savetxt('pre_att/p_1d', para_weights)
+        np.savetxt('pre_att/p_3d', para_weights)
 
-    def score_diversity(self, pred_att_ratio, real_att, ranks, beta=0.8):
+    def score_diversity(self, pred_att_ratio, real_att, ranks):
         real_att = real_att.numpy()[0, :]
         length = np.sum(real_att)
         real_att /= length
@@ -178,7 +183,7 @@ class RUN:
                 continue
             score += np.log(np.minimum(real_att[i], pred_att_ratio[i]))
 
-        return beta * score
+        return args.beta * score
 
     def eval_by_beam_search(self):
         pre_att = PreAtt()
@@ -186,7 +191,7 @@ class RUN:
             pw = pre_att.ex_pred(pb, ranks)
             return pw.numpy().reshape([-1])
 
-        batch_set = generate_batch(1, mode='test', para_num=30, para_len=100)
+        batch_set = generate_batch(1, mode='test', para_num=args.para_num, para_len=args.para_len)
         bng = args.block_n_grams
         bnw = args.block_n_words_before
         for (batch, batch_contents) in enumerate(batch_set):
@@ -206,18 +211,19 @@ class RUN:
             update_beam = 0
 
             # compression
-            '''
+
             _, _, pb = self.seq2seq(inp, False, ranks, initial_dec_inp)
             pred_pw = predict_para_att_ratio(pb, ranks)
             count_zero = list(ranks[0,:]).count(0)
-            fil_len = 25
+            fil_len = args.compress_s
             fil, fil_id = tf.nn.top_k(pred_pw, fil_len)
-            if fil_len > 30 - count_zero:
-                count_remove = count_zero - (30 - fil_len)
+            if fil_len > args.para_num - count_zero:
+                count_remove = count_zero - (args.para_num - fil_len)
                 fil_id = fil_id[:-count_remove]
+            fil_id = tf.sort(fil_id, direction='ASCENDING')
             inp = inp[:, fil_id, :]
             ranks = np.ones(shape=(1, len(fil_id)))
-            '''
+
             # generation
             for step in range(200):
                 temp = []
@@ -268,7 +274,7 @@ class RUN:
 
                 for o in output.copy():
 
-                    if o[0][0, -1].numpy() == 5:
+                    if o[0][0, -1].numpy() == args.beam_size:
 
                         output.remove(o)
                         _, pw, pb = self.seq2seq(inp, False, ranks, o[0][:, :-1], cal_pw=True)
@@ -292,7 +298,7 @@ class RUN:
             abs1 = [int(i) for i in abs1]
             out_sen = self.sp.decode_ids(abs1)
 
-            with open('b_0.8_n.txt', 'a',encoding='utf8') as fw:
+            with open('summary.txt', 'a',encoding='utf8') as fw:
                 fw.write(out_sen)
                 fw.write('\n')
 
@@ -301,15 +307,18 @@ class RUN:
         tar_inp = tar[:, :-1]
         tar_real = tar[:, 1:]
 
-        pre, _, = self.seq2seq(inp, False, ranks, tar_inp)
+        pre, _, _ = self.seq2seq(inp, False, ranks, tar_inp)
 
         loss = self.masked_loss_function(tar_real, pre)
         self.train_loss(loss)
 
     def valid(self):
-        path_range = range(1, 14)
+        path_range = range(1, 50)
         for path in path_range:
-            self.ckpt.restore('checkpoints/train_large_st_1d_s_25/ckpt-{}'.format(path))
+            try:
+                self.ckpt.restore('{}/ckpt-{}'.format(args.ckpt_path, path))
+            except:
+                continue
             print('ckpt-{} restored'.format(path))
             start = time.time()
             self.train_loss.reset_states()
@@ -366,7 +375,7 @@ class PreAtt(object):
         self.train_loss = tf.keras.metrics.Mean(name='train_loss')
         self.val_loss = tf.keras.metrics.Mean(name='val_loss')
 
-        checkpoint_path = './checkpoints2/3d_l_n3'
+        checkpoint_path = args.ckpt_path_att
 
         ckpt = tf.train.Checkpoint(model=self.model,
                                    optimizer=self.optimizer)
@@ -390,7 +399,7 @@ class PreAtt(object):
 
         loss_ = tf.keras.losses.mse(real, pre)
 
-        return tf.reduce_mean(loss_) * tf.constant([100], tf.float32)
+        return tf.reduce_mean(loss_)
 
     def train_step(self, inp, real, ranks):
         with tf.GradientTape() as tape:
@@ -413,15 +422,14 @@ class PreAtt(object):
 
     def train(self):
         seq2seq = self.seq2seq_model()
-        t_loss = []
-        v_loss = []
+
         for epoch in range(2):
             start = time.time()
 
             self.train_loss.reset_states()
             self.val_loss.reset_states()
             print('start training')
-            batch_set = generate_batch(64)
+            batch_set = generate_batch(32, para_num=args.para_num, para_len=args.para_len)
             for (batch, batch_contents) in enumerate(batch_set):
                 inp, tar, ranks = batch_contents
                 tar_inp = tar[:, :-1]
@@ -432,40 +440,34 @@ class PreAtt(object):
 
                 self.train_step(pb, pw, ranks)
 
-                if batch % 2000 == 0 and batch > 0:
-                    print('Epoch {} Batch {} Loss {:.4f}'.format(
+                if batch % 50 == 0 and batch > 0:
+                    print('Epoch {} Batch {} Loss {:.8f}'.format(
                         epoch + 1, batch, self.train_loss.result()))
 
-                    t_loss.append(float(self.train_loss.result()))
+            ckpt_save_path = self.ckpt_manager.save()
+            print('Saving checkpoint for epoch {} at {}'.format(epoch + 1,
+                                                                ckpt_save_path))
 
-                    ckpt_save_path = self.ckpt_manager.save()
-                    print('Saving checkpoint for epoch {} at {}'.format(epoch + 1,
-                                                                        ckpt_save_path))
+            print('Epoch {} Loss {:.4f}'.format(epoch + 1, self.train_loss.result()))
+            print('\nstart validation')
+            val_batch = generate_batch(32, mode='valid')
+            for (b, bc) in enumerate(val_batch):
+                inp, tar, ranks = bc
+                tar_inp = tar[:, :-1]
+                tar_real = tar[:, 1:]
+                _, pw, pb = seq2seq(inp, False, ranks, tar_inp, tar_real, True)
 
-                    # print('Epoch {} Loss {:.4f}'.format(epoch + 1, self.train_loss.result()))
-                    print('\nstart validation')
-                    val_batch = generate_batch(64, mode='valid')
-                    for (b, bc) in enumerate(val_batch):
-                        inp, tar, ranks = bc
-                        tar_inp = tar[:, :-1]
-                        tar_real = tar[:, 1:]
-                        _, pw, pb = seq2seq(inp, False, ranks, tar_inp, tar_real, True)
+                pw /= tf.reduce_sum(pw, axis=1, keepdims=True)
+                self.val_step(pb, pw, ranks)
 
-                        pw /= tf.reduce_sum(pw, axis=1, keepdims=True)
-                        self.val_step(pb, pw, ranks)
+            print('Validation: Loss {:.8f}'.format(self.val_loss.result()))
 
-                    print('Validation: Loss {:.4f}'.format(self.val_loss.result()))
-                    v_loss.append(float(self.val_loss.result()))
-
-                    print('Time taken for 1 epoch: {} secs\n'.format(time.time() - start))
-                    self.train_loss.reset_states()
-                    self.val_loss.reset_states()
-        pd.DataFrame({'t_loss':t_loss, 'v_loss':v_loss}).to_csv('att_pre1.csv')
+            print('Time taken for 1 epoch: {} secs\n'.format(time.time() - start))
 
     def valid(self):
         seq2seq = self.seq2seq_model()
         self.val_loss.reset_states()
-        val_batch = generate_batch(64, mode='valid')
+        val_batch = generate_batch(32, mode='valid', para_num=args.para_num, para_len=args.para_len)
         for (b, bc) in enumerate(val_batch):
             inp, tar, ranks = bc
             tar_inp = tar[:, :-1]
@@ -475,7 +477,7 @@ class PreAtt(object):
             pw /= tf.reduce_sum(pw, axis=1, keepdims=True)
             self.val_step(pb, pw, ranks)
 
-        print('Validation: Loss {:.4f}'.format(self.val_loss.result()))
+        print('Validation: Loss {:.8f}'.format(self.val_loss.result()))
 
     def predict(self):
         seq2seq = self.seq2seq_model()
@@ -507,8 +509,20 @@ class PreAtt(object):
 
 if __name__ == "__main__":
     args = parse_args()
-    a = PreAtt()
-    a.train()
+    if 'att' not in args.mode:
+        a = RUN()
+        if args.mode == 'train':
+            a.train()
+        if args.mode == 'valid':
+            a.valid()
+        if args.mode == 'gen':
+            a.eval_by_beam_search()
+    else:
+        b = PreAtt()
+        if args.mode == 'train_att':
+            b.train()
+        if args.mode == 'valid_att':
+            b.valid()
 
     #b = PreAtt()
     #b.train()
