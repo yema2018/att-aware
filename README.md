@@ -8,6 +8,7 @@ Preparation
  
  You should dowload above checkpoints and dataset and put them in your project.
 
+ We use rouge from https://github.com/pltrdy/rouge as our evaluation metric.
 
 
  Train HT
