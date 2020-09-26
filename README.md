@@ -2,7 +2,7 @@ We create a Hierarchical Transformer for multi-document summarization and an att
 
 Preparation
 -------
- You can find the best checkpoints from https://pan.baidu.com/s/1Jiccf2_f9zJ4CB7e0V2coA code: e3vd, inclduing the best ckpt for the summarization model and ckpts for the attention prediction model.
+ You can find the best checkpoints from https://drive.google.com/file/d/16d7tBkOXmPf5c5q4ANUfh-QkZMjG4zzR/view?usp=sharing, inclduing the best ckpt for the summarization model and ckpts for the attention prediction model.
  
  The ranked WikiSum dataset from https://github.com/nlpyang/hiersumm
  
